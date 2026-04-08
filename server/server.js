@@ -1,5 +1,6 @@
 'use strict';
 const WebSocket = require('ws');
+const crypto = require('crypto');
 const { createInitialBoard, isInCheck, getValidMoves, applyBoardMove, hasAnyMoves } = require('./chessLogic');
 
 const PORT = process.env.PORT || 8080;
@@ -32,8 +33,15 @@ const CAPTURE_DEST = [
 
 const createReserve = () => ({ P:0, R:0, N:0, B:0, Q:0 });
 
-let gameState = createFreshGame();
-const clientMap = new Map(); // ws -> slotIdx
+// games: gameId -> gameState
+const games = new Map();
+// clientMap: ws -> { gameId, slot }
+const clientMap = new Map();
+
+function generateGameId() {
+  // 6 hex chars, e.g. "A3F9B2"
+  return crypto.randomBytes(3).toString('hex').toUpperCase();
+}
 
 function createFreshGame() {
   return {
@@ -51,14 +59,61 @@ function createFreshGame() {
     players: [null, null, null, null],
     gameOver: null,
     status: 'waiting', // 'waiting' | 'playing' | 'over'
-    inCheck: [null, null], // which color is in check on each board
+    inCheck: [null, null],
   };
 }
 
+// ─── Game list helpers ────────────────────────────────────────────────────────
+
+function gameListPublic() {
+  return [...games.entries()].map(([id, g]) => ({
+    id,
+    players: g.players,
+    status: g.status,
+    playerCount: g.players.filter(p => p !== null).length,
+  }));
+}
+
+/** Send the current game list to all clients not currently in a game. */
+function broadcastGameList() {
+  const msg = JSON.stringify({ type: 'GAME_LIST', games: gameListPublic() });
+  for (const ws of wss.clients) {
+    if (ws.readyState === WebSocket.OPEN && !clientMap.has(ws)) {
+      ws.send(msg);
+    }
+  }
+}
+
+/** Send a message to all clients inside a specific game. */
+function broadcastToGame(gameId, msg) {
+  const data = JSON.stringify(msg);
+  for (const [ws, info] of clientMap.entries()) {
+    if (info.gameId === gameId && ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+  }
+}
+
+function publicState(game) {
+  return {
+    boards: game.boards,
+    currentTurn: game.currentTurn,
+    reserves: game.reserves,
+    enPassant: game.enPassant,
+    castling: game.castling,
+    players: game.players,
+    gameOver: game.gameOver,
+    status: game.status,
+    inCheck: game.inCheck,
+  };
+}
+
+// ─── Connection lifecycle ─────────────────────────────────────────────────────
+
 wss.on('connection', (ws) => {
   console.log('Client connected');
-  // Send current state so they can see lobby
-  send(ws, { type: 'STATE', state: publicState() });
+  // New connection gets the current game list (dashboard view)
+  send(ws, { type: 'GAME_LIST', games: gameListPublic() });
 
   ws.on('message', (raw) => {
     try {
@@ -70,133 +125,184 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    const slot = clientMap.get(ws);
-    if (slot !== undefined) {
-      console.log(`Slot ${slot} disconnected`);
-      gameState.players[slot] = null;
+    const info = clientMap.get(ws);
+    if (info) {
+      const { gameId, slot } = info;
+      const game = games.get(gameId);
+      if (game) {
+        console.log(`Game ${gameId}: Slot ${slot} (${game.players[slot]}) disconnected`);
+        game.players[slot] = null;
+        // Clean up empty waiting games
+        if (game.status === 'waiting' && game.players.every(p => p === null)) {
+          games.delete(gameId);
+          console.log(`Game ${gameId} removed (empty)`);
+        } else {
+          broadcastToGame(gameId, { type: 'STATE', state: publicState(game) });
+        }
+      }
       clientMap.delete(ws);
-      broadcast({ type: 'STATE', state: publicState() });
     }
+    broadcastGameList();
   });
 });
 
+// ─── Message router ───────────────────────────────────────────────────────────
+
 function handle(ws, msg) {
   switch(msg.type) {
-    case 'JOIN':    return handleJoin(ws, msg);
-    case 'MOVE':    return handleMove(ws, msg);
-    case 'DROP':    return handleDrop(ws, msg);
-    case 'RESET':   return handleReset(ws);
-    case 'GET_VALID_DROPS': return handleGetDrops(ws, msg);
+    case 'CREATE_GAME':      return handleCreateGame(ws);
+    case 'LIST_GAMES':       return send(ws, { type: 'GAME_LIST', games: gameListPublic() });
+    case 'JOIN':             return handleJoin(ws, msg);
+    case 'MOVE':             return handleMove(ws, msg);
+    case 'DROP':             return handleDrop(ws, msg);
+    case 'RESET':            return handleReset(ws);
+    case 'GET_VALID_DROPS':  return handleGetDrops(ws, msg);
   }
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
+function handleCreateGame(ws) {
+  let gameId;
+  do { gameId = generateGameId(); } while (games.has(gameId));
+  games.set(gameId, createFreshGame());
+  console.log(`Game ${gameId} created`);
+  send(ws, { type: 'GAME_CREATED', gameId });
+  broadcastGameList();
 }
 
 function handleJoin(ws, msg) {
-  const { slot, name } = msg;
+  const { gameId, slot, name } = msg;
+
+  const game = games.get(gameId);
+  if (!game) return send(ws, { type: 'ERROR', message: 'Game not found' });
   if (slot < 0 || slot > 3) return send(ws, { type: 'ERROR', message: 'Invalid slot' });
-  if (gameState.players[slot] !== null) {
-    const existingWs = [...clientMap.entries()].find(([,s])=>s===slot)?.[0];
-    if (existingWs && existingWs !== ws && existingWs.readyState === WebSocket.OPEN)
-      return send(ws, { type: 'ERROR', message: 'Slot already taken' });
+  if (game.status === 'over') return send(ws, { type: 'ERROR', message: 'Game is already over' });
+
+  // Block slot if taken by an active connection
+  if (game.players[slot] !== null) {
+    const existingEntry = [...clientMap.entries()].find(
+      ([, info]) => info.gameId === gameId && info.slot === slot
+    );
+    if (existingEntry) {
+      const [existingWs] = existingEntry;
+      if (existingWs !== ws && existingWs.readyState === WebSocket.OPEN) {
+        return send(ws, { type: 'ERROR', message: 'Slot already taken' });
+      }
+      // Dead connection — evict it
+      clientMap.delete(existingWs);
+    }
   }
-  // Kick old ws for this slot if dead
-  for (const [w,s] of clientMap.entries()) {
-    if (s === slot && w !== ws) clientMap.delete(w);
+
+  // If this ws was previously in a different game, vacate that slot
+  const prevInfo = clientMap.get(ws);
+  if (prevInfo && prevInfo.gameId !== gameId) {
+    const prevGame = games.get(prevInfo.gameId);
+    if (prevGame) {
+      prevGame.players[prevInfo.slot] = null;
+      broadcastToGame(prevInfo.gameId, { type: 'STATE', state: publicState(prevGame) });
+    }
   }
-  clientMap.set(ws, slot);
-  gameState.players[slot] = name || `Player ${slot+1}`;
-  // Start game once all 4 joined
-  if (gameState.players.every(p=>p!==null) && gameState.status==='waiting') {
-    gameState.status = 'playing';
+
+  clientMap.set(ws, { gameId, slot });
+  game.players[slot] = name || `Player ${slot + 1}`;
+
+  // Auto-start once all 4 slots are filled
+  if (game.players.every(p => p !== null) && game.status === 'waiting') {
+    game.status = 'playing';
   }
+
   send(ws, { type: 'JOINED', slot, config: PLAYER_CONFIG[slot] });
-  broadcast({ type: 'STATE', state: publicState() });
+  broadcastToGame(gameId, { type: 'STATE', state: publicState(game) });
+  broadcastGameList();
 }
 
 function handleMove(ws, msg) {
-  const slot = clientMap.get(ws);
-  if (slot === undefined) return send(ws, { type: 'ERROR', message: 'Not joined' });
-  if (gameState.status !== 'playing') return send(ws, { type: 'ERROR', message: 'Game not started' });
+  const info = clientMap.get(ws);
+  if (!info) return send(ws, { type: 'ERROR', message: 'Not joined' });
+  const { gameId, slot } = info;
+  const game = games.get(gameId);
+  if (!game) return send(ws, { type: 'ERROR', message: 'Game not found' });
+  if (game.status !== 'playing') return send(ws, { type: 'ERROR', message: 'Game not started' });
 
   const { boardIdx, fromR, fromC, toR, toC, promotion } = msg;
   const cfg = PLAYER_CONFIG[slot];
 
   if (cfg.boardIdx !== boardIdx) return send(ws, { type: 'ERROR', message: 'Wrong board' });
-  if (gameState.currentTurn[boardIdx] !== cfg.color) return send(ws, { type: 'ERROR', message: 'Not your turn' });
+  if (game.currentTurn[boardIdx] !== cfg.color) return send(ws, { type: 'ERROR', message: 'Not your turn' });
 
-  const board = gameState.boards[boardIdx];
+  const board = game.boards[boardIdx];
   const piece = board[fromR][fromC];
   if (!piece || piece.color !== cfg.color) return send(ws, { type: 'ERROR', message: 'Not your piece' });
 
-  const validMoves = getValidMoves(board, fromR, fromC, gameState.enPassant[boardIdx], gameState.castling[boardIdx]);
+  const validMoves = getValidMoves(board, fromR, fromC, game.enPassant[boardIdx], game.castling[boardIdx]);
   if (!validMoves.some(([r,c]) => r===toR && c===toC)) return send(ws, { type: 'ERROR', message: 'Illegal move' });
 
   const { newBoard, captured, newEnPassant, newCastling } = applyBoardMove(
-    board, fromR, fromC, toR, toC, gameState.castling[boardIdx], promotion || 'Q'
+    board, fromR, fromC, toR, toC, game.castling[boardIdx], promotion || 'Q'
   );
 
-  gameState.boards[boardIdx] = newBoard;
-  gameState.enPassant[boardIdx] = newEnPassant;
-  gameState.castling[boardIdx] = newCastling;
+  game.boards[boardIdx] = newBoard;
+  game.enPassant[boardIdx] = newEnPassant;
+  game.castling[boardIdx] = newCastling;
 
-  // Route captured piece to teammate's reserve
   if (captured && captured.type !== 'K') {
     const dest = CAPTURE_DEST[slot];
-    gameState.reserves[dest.boardIdx][dest.color][captured.type]++;
+    game.reserves[dest.boardIdx][dest.color][captured.type]++;
   }
 
-  // Switch turn
-  gameState.currentTurn[boardIdx] = gameState.currentTurn[boardIdx] === 'w' ? 'b' : 'w';
+  game.currentTurn[boardIdx] = game.currentTurn[boardIdx] === 'w' ? 'b' : 'w';
 
-  // Update check state
   const oppColor = cfg.color === 'w' ? 'b' : 'w';
-  gameState.inCheck[boardIdx] = isInCheck(newBoard, oppColor) ? oppColor : null;
+  game.inCheck[boardIdx] = isInCheck(newBoard, oppColor) ? oppColor : null;
 
-  // Check for game over
-  checkGameOver(boardIdx, oppColor);
-  broadcast({ type: 'STATE', state: publicState() });
+  checkGameOver(game, boardIdx, oppColor);
+  broadcastToGame(gameId, { type: 'STATE', state: publicState(game) });
 }
 
 function handleDrop(ws, msg) {
-  const slot = clientMap.get(ws);
-  if (slot === undefined) return send(ws, { type: 'ERROR', message: 'Not joined' });
-  if (gameState.status !== 'playing') return send(ws, { type: 'ERROR', message: 'Game not started' });
+  const info = clientMap.get(ws);
+  if (!info) return send(ws, { type: 'ERROR', message: 'Not joined' });
+  const { gameId, slot } = info;
+  const game = games.get(gameId);
+  if (!game) return send(ws, { type: 'ERROR', message: 'Game not found' });
+  if (game.status !== 'playing') return send(ws, { type: 'ERROR', message: 'Game not started' });
 
   const { boardIdx, pieceType, row, col } = msg;
   const cfg = PLAYER_CONFIG[slot];
 
   if (cfg.boardIdx !== boardIdx) return send(ws, { type: 'ERROR', message: 'Wrong board' });
-  if (gameState.currentTurn[boardIdx] !== cfg.color) return send(ws, { type: 'ERROR', message: 'Not your turn' });
+  if (game.currentTurn[boardIdx] !== cfg.color) return send(ws, { type: 'ERROR', message: 'Not your turn' });
 
-  const board = gameState.boards[boardIdx];
+  const board = game.boards[boardIdx];
   if (board[row][col]) return send(ws, { type: 'ERROR', message: 'Square occupied' });
   if (pieceType==='P' && (row===0||row===7)) return send(ws, { type: 'ERROR', message: 'Pawns cannot be placed on first or last rank' });
 
-  const reserve = gameState.reserves[boardIdx][cfg.color];
+  const reserve = game.reserves[boardIdx][cfg.color];
   if (!reserve[pieceType] || reserve[pieceType] <= 0) return send(ws, { type: 'ERROR', message: 'Piece not in reserve' });
 
-  // Apply drop
   board[row][col] = { type: pieceType, color: cfg.color };
   reserve[pieceType]--;
 
-  // Switch turn
-  gameState.currentTurn[boardIdx] = gameState.currentTurn[boardIdx] === 'w' ? 'b' : 'w';
+  game.currentTurn[boardIdx] = game.currentTurn[boardIdx] === 'w' ? 'b' : 'w';
 
-  // Update check state on both boards (drop could create discovered... no, just update this board)
   const oppColor = cfg.color === 'w' ? 'b' : 'w';
-  gameState.inCheck[boardIdx] = isInCheck(board, oppColor) ? oppColor : null;
+  game.inCheck[boardIdx] = isInCheck(board, oppColor) ? oppColor : null;
 
-  checkGameOver(boardIdx, oppColor);
-  broadcast({ type: 'STATE', state: publicState() });
+  checkGameOver(game, boardIdx, oppColor);
+  broadcastToGame(gameId, { type: 'STATE', state: publicState(game) });
 }
 
 function handleGetDrops(ws, msg) {
-  const slot = clientMap.get(ws);
-  if (slot === undefined) return;
+  const info = clientMap.get(ws);
+  if (!info) return;
+  const game = games.get(info.gameId);
+  if (!game) return;
   const { boardIdx, pieceType } = msg;
-  const board = gameState.boards[boardIdx];
+  const board = game.boards[boardIdx];
   const squares = [];
-  for (let r=0;r<8;r++) {
-    for (let c=0;c<8;c++) {
+  for (let r=0; r<8; r++) {
+    for (let c=0; c<8; c++) {
       if (!board[r][c]) {
         if (pieceType==='P' && (r===0||r===7)) continue;
         squares.push([r,c]);
@@ -207,54 +313,43 @@ function handleGetDrops(ws, msg) {
 }
 
 function handleReset(ws) {
-  const slot = clientMap.get(ws);
-  if (slot === undefined) return;
-  gameState = createFreshGame();
-  // Re-register all current clients
-  for (const [w,s] of clientMap.entries()) {
-    gameState.players[s] = `Player ${s+1}`;
+  const info = clientMap.get(ws);
+  if (!info) return;
+  const { gameId } = info;
+  const game = games.get(gameId);
+  if (!game) return;
+
+  const freshGame = createFreshGame();
+  // Re-register all currently connected players in this game
+  for (const [, wInfo] of clientMap.entries()) {
+    if (wInfo.gameId === gameId) {
+      freshGame.players[wInfo.slot] = game.players[wInfo.slot] || `Player ${wInfo.slot + 1}`;
+    }
   }
-  if (gameState.players.filter(p=>p!==null).length === 4) gameState.status = 'playing';
-  broadcast({ type: 'STATE', state: publicState() });
+  if (freshGame.players.filter(p => p !== null).length === 4) freshGame.status = 'playing';
+  games.set(gameId, freshGame);
+  broadcastToGame(gameId, { type: 'STATE', state: publicState(freshGame) });
+  broadcastGameList();
 }
 
-function checkGameOver(boardIdx, colorToCheck) {
-  if (gameState.gameOver) return;
-  const board = gameState.boards[boardIdx];
-  // Checkmate: in check AND no valid moves AND partner has no pieces to bail them out
-  // (Simplified: check + no moves = checkmate)
+// ─── Game over ────────────────────────────────────────────────────────────────
+
+function checkGameOver(game, boardIdx, colorToCheck) {
+  if (game.gameOver) return;
+  const board = game.boards[boardIdx];
   if (isInCheck(board, colorToCheck) &&
-      !hasAnyMoves(board, colorToCheck, gameState.enPassant[boardIdx], gameState.castling[boardIdx])) {
+      !hasAnyMoves(board, colorToCheck, game.enPassant[boardIdx], game.castling[boardIdx])) {
     const winningTeam = colorToCheck === 'b' ? 'A' : 'B';
-    gameState.gameOver = `Team ${winningTeam} wins by checkmate on Board ${boardIdx+1}!`;
-    gameState.status = 'over';
+    game.gameOver = `Team ${winningTeam} wins by checkmate on Board ${boardIdx+1}!`;
+    game.status = 'over';
   }
 }
 
-function publicState() {
-  return {
-    boards: gameState.boards,
-    currentTurn: gameState.currentTurn,
-    reserves: gameState.reserves,
-    enPassant: gameState.enPassant,
-    castling: gameState.castling,
-    players: gameState.players,
-    gameOver: gameState.gameOver,
-    status: gameState.status,
-    inCheck: gameState.inCheck,
-  };
-}
+// ─── Utilities ────────────────────────────────────────────────────────────────
 
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  for (const ws of wss.clients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  }
-}
-
 console.log(`🎮 Bughouse Chess server running on ws://localhost:${PORT}`);
-console.log('Waiting for 4 players to connect...');
+console.log('Waiting for players to connect...');

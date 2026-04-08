@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator
+  ScrollView, KeyboardAvoidingView, Platform, ActivityIndicator,
 } from 'react-native';
 import { useGame, PLAYER_CONFIG } from '../context/GameContext';
 
@@ -9,56 +9,66 @@ const TEAM_A_COLOR = '#4CAF50';
 const TEAM_B_COLOR = '#2196F3';
 
 export default function LobbyScreen() {
-  const { connect, connected, error, state, mySlot } = useGame();
-  const [serverUrl, setServerUrl] = useState('ws://localhost:8080');
+  const { joinSlot, leaveGame, games, gameId, state, mySlot, error } = useGame();
   const [name, setName] = useState('');
   const [selectedSlot, setSelectedSlot] = useState(null);
   const [joining, setJoining] = useState(false);
 
+  // Use live game state if available (after joining), otherwise fall back to game list entry
+  const gamePlayers = state?.players ?? games.find(g => g.id === gameId)?.players ?? [null, null, null, null];
+  const playerCount = gamePlayers.filter(p => p !== null).length;
+
   const handleJoin = () => {
-    if (selectedSlot === null) return;
-    if (!name.trim()) return;
+    if (selectedSlot === null || !name.trim()) return;
     setJoining(true);
-    connect(serverUrl.trim(), selectedSlot, name.trim());
+    joinSlot(selectedSlot, name.trim());
     setTimeout(() => setJoining(false), 3000);
   };
 
-  const playerCount = state ? state.players.filter(p => p !== null).length : 0;
+  const renderSlot = (slot, teamColor) => {
+    const cfg = PLAYER_CONFIG[slot];
+    const takenBy = gamePlayers[slot];
+    const isTaken = takenBy && mySlot !== slot;
+    const isMine = mySlot === slot;
+    return (
+      <TouchableOpacity
+        key={slot}
+        style={[
+          styles.slotBtn,
+          selectedSlot === slot && styles.slotSelected,
+          isMine && styles.slotMine,
+          isTaken && styles.slotTaken,
+          { borderColor: teamColor + '88' },
+        ]}
+        onPress={() => !isTaken && setSelectedSlot(slot)}
+        disabled={isTaken}
+      >
+        <Text style={styles.slotName}>{cfg.label}</Text>
+        {takenBy ? (
+          <Text style={styles.slotPlayer}>{isMine ? '👑 You' : `🙋 ${takenBy}`}</Text>
+        ) : (
+          <Text style={styles.slotEmpty}>Open</Text>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.chess}>♟</Text>
-          <Text style={styles.title}>Bughouse Chess</Text>
-          <Text style={styles.subtitle}>4-Player Co-op Chess</Text>
-        </View>
-
-        {/* Rules card */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>How to Play</Text>
-          <Text style={styles.rule}>♟ 2 boards, 4 players, 2 teams</Text>
-          <Text style={styles.rule}>♟ Capture a piece → your teammate can drop it</Text>
-          <Text style={styles.rule}>♟ Drop captured pieces anywhere (not pawns on rank 1/8)</Text>
-          <Text style={styles.rule}>♟ Checkmate either king on either board to win</Text>
-        </View>
-
-        {/* Connection */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Server</Text>
-          <TextInput
-            style={styles.input}
-            value={serverUrl}
-            onChangeText={setServerUrl}
-            placeholder="ws://192.168.x.x:8080"
-            placeholderTextColor="#556"
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <Text style={styles.hint}>
-            {connected ? '🟢 Connected' : '⚪ Not connected'} {playerCount > 0 ? `· ${playerCount}/4 players` : ''}
-          </Text>
+          <TouchableOpacity style={styles.backBtn} onPress={leaveGame}>
+            <Text style={styles.backBtnText}>← Games</Text>
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Text style={styles.title}>Game Lobby</Text>
+            <Text style={styles.gameIdText}>#{gameId}</Text>
+          </View>
+          <View style={styles.headerRight}>
+            <Text style={styles.playerBadge}>{playerCount}/4</Text>
+          </View>
         </View>
 
         {/* Name */}
@@ -78,72 +88,13 @@ export default function LobbyScreen() {
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Choose Your Seat</Text>
           <View style={styles.teamsRow}>
-            {/* Team A */}
             <View style={styles.team}>
               <Text style={[styles.teamLabel, { color: TEAM_A_COLOR }]}>Team A</Text>
-              {[0, 1].map(slot => {
-                const cfg = PLAYER_CONFIG[slot];
-                const takenBy = state?.players[slot];
-                const isTaken = takenBy && mySlot !== slot;
-                const isMine = mySlot === slot;
-                return (
-                  <TouchableOpacity
-                    key={slot}
-                    style={[
-                      styles.slotBtn,
-                      selectedSlot === slot && styles.slotSelected,
-                      isMine && styles.slotMine,
-                      isTaken && styles.slotTaken,
-                      { borderColor: TEAM_A_COLOR + '88' },
-                    ]}
-                    onPress={() => !isTaken && setSelectedSlot(slot)}
-                    disabled={isTaken}
-                  >
-                    <Text style={styles.slotName}>{cfg.label}</Text>
-                    {takenBy ? (
-                      <Text style={styles.slotPlayer}>
-                        {isMine ? '👑 You' : `🙋 ${takenBy}`}
-                      </Text>
-                    ) : (
-                      <Text style={styles.slotEmpty}>Open</Text>
-                    )}
-                  </TouchableOpacity>
-                );
-              })}
+              {[0, 1].map(slot => renderSlot(slot, TEAM_A_COLOR))}
             </View>
-
-            {/* Team B */}
             <View style={styles.team}>
               <Text style={[styles.teamLabel, { color: TEAM_B_COLOR }]}>Team B</Text>
-              {[2, 3].map(slot => {
-                const cfg = PLAYER_CONFIG[slot];
-                const takenBy = state?.players[slot];
-                const isTaken = takenBy && mySlot !== slot;
-                const isMine = mySlot === slot;
-                return (
-                  <TouchableOpacity
-                    key={slot}
-                    style={[
-                      styles.slotBtn,
-                      selectedSlot === slot && styles.slotSelected,
-                      isMine && styles.slotMine,
-                      isTaken && styles.slotTaken,
-                      { borderColor: TEAM_B_COLOR + '88' },
-                    ]}
-                    onPress={() => !isTaken && setSelectedSlot(slot)}
-                    disabled={isTaken}
-                  >
-                    <Text style={styles.slotName}>{cfg.label}</Text>
-                    {takenBy ? (
-                      <Text style={styles.slotPlayer}>
-                        {isMine ? '👑 You' : `🙋 ${takenBy}`}
-                      </Text>
-                    ) : (
-                      <Text style={styles.slotEmpty}>Open</Text>
-                    )}
-                  </TouchableOpacity>
-                );
-              })}
+              {[2, 3].map(slot => renderSlot(slot, TEAM_B_COLOR))}
             </View>
           </View>
         </View>
@@ -160,7 +111,7 @@ export default function LobbyScreen() {
             <ActivityIndicator color="#fff" />
           ) : (
             <Text style={styles.joinBtnText}>
-              {mySlot !== null ? '🔄 Rejoin' : '🎮 Join Game'}
+              {mySlot !== null ? '🔄 Change Seat' : '🎮 Join Game'}
             </Text>
           )}
         </TouchableOpacity>
@@ -170,6 +121,7 @@ export default function LobbyScreen() {
             Waiting for {4 - playerCount} more player{4 - playerCount !== 1 ? 's' : ''}...
           </Text>
         )}
+
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -181,23 +133,41 @@ const styles = StyleSheet.create({
     paddingBottom: 40,
   },
   header: {
+    flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 24,
+    paddingVertical: 16,
   },
-  chess: {
-    fontSize: 48,
-    marginBottom: 8,
+  backBtn: {
+    paddingVertical: 6,
+    paddingRight: 12,
+  },
+  backBtnText: {
+    color: '#2196F3',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  headerCenter: {
+    flex: 1,
+    alignItems: 'center',
   },
   title: {
     color: '#FFF',
-    fontSize: 28,
+    fontSize: 20,
     fontWeight: 'bold',
-    letterSpacing: 1,
   },
-  subtitle: {
+  gameIdText: {
     color: '#8899bb',
+    fontSize: 13,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    marginTop: 2,
+  },
+  headerRight: {
+    paddingLeft: 12,
+  },
+  playerBadge: {
+    color: '#4CAF50',
     fontSize: 14,
-    marginTop: 4,
+    fontWeight: '700',
   },
   card: {
     backgroundColor: '#1a2535',
@@ -215,12 +185,6 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     marginBottom: 10,
   },
-  rule: {
-    color: '#ccd',
-    fontSize: 13,
-    marginBottom: 4,
-    lineHeight: 20,
-  },
   input: {
     backgroundColor: '#0d1520',
     color: '#FFF',
@@ -229,11 +193,6 @@ const styles = StyleSheet.create({
     fontSize: 15,
     borderWidth: 1,
     borderColor: '#2a3a50',
-  },
-  hint: {
-    color: '#667',
-    fontSize: 11,
-    marginTop: 6,
   },
   teamsRow: {
     flexDirection: 'row',
